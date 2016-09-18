@@ -101,6 +101,8 @@ class Agent(object):
                 callbacks.on_step_end(episode_step, step_logs)
                 episode_step += 1
                 self.step += 1
+                import IPython
+                IPython.embed()
 
                 if done or (nb_max_episode_steps and episode_step > nb_max_episode_steps):
                     # This episode is finished, report and reset.
@@ -123,6 +125,138 @@ class Agent(object):
         callbacks.on_train_end(logs={'did_abort': did_abort})
 
         return history
+
+
+    def fit_ma(self, env, nb_steps, action_repetition=1, callbacks=None, verbose=1,
+            visualize=False, nb_max_start_steps=0, start_step_policy=None, log_interval=10000,
+            nb_max_episode_steps=None):
+        if not self.compiled:
+            raise RuntimeError('Your tried to fit your agent but it hasn\'t been compiled yet. Please call `compile()` before `fit()`.')
+        if action_repetition < 1:
+            raise ValueError('action_repetition must be >= 1, is {}'.format(action_repetition))
+
+        self.training = True
+        
+        callbacks = [] if not callbacks else callbacks[:]
+
+        if verbose == 1:
+            callbacks += [TrainIntervalLogger(interval=log_interval)]
+        elif verbose > 1:
+            callbacks += [TrainEpisodeLogger()]
+        if visualize:
+            callbacks += [Visualizer()]
+        history = History()
+        callbacks += [history]
+        callbacks = CallbackList(callbacks)
+        callbacks._set_model(self)
+        callbacks._set_env(env)
+        callbacks._set_params({
+            'nb_steps': nb_steps,
+        })
+        callbacks.on_train_begin()
+
+        episode = 0
+        self.step = 0
+        observation = None
+        episode_reward = None
+        episode_step = None
+        did_abort = False
+        try:
+            while self.step < nb_steps:
+                if observation is None:  # start of a new episode
+                    callbacks.on_episode_begin(episode)
+                    episode_step = 0
+                    episode_reward = 0.
+
+                    # Obtain the initial observation by resetting the environment.
+                    self.reset_states()
+                    observation = env.reset()
+                    assert observation is not None
+
+                    # Perform random starts at beginning of episode and do not record them into the experience.
+                    # This slightly changes the start position between games.
+                    nb_random_start_steps = 0 if nb_max_start_steps == 0 else np.random.randint(nb_max_start_steps)
+                    for _ in range(nb_random_start_steps):
+                        action_list = []
+                        for i in xrange(len(env.agents)):
+                            if start_step_policy is None:
+                                action = env.action_space.sample()
+                            else:
+                                action = start_step_policy(observation[i])
+                            action_list.append(action)
+                            callbacks.on_action_begin(action)
+                        observation, _, done, _ = env.step(action_list)
+                        for a in action_list:
+                            callbacks.on_action_end(a)
+                        if done:
+                            warnings.warn('Env ended before {} random steps could be performed at the start. You should probably lower the `nb_max_start_steps` parameter.'.format(nb_random_start_steps))
+                            observation = env.reset()
+                            break
+
+                # At this point, we expect to be fully initialized.
+                assert episode_reward is not None
+                assert episode_step is not None
+                assert observation is not None
+
+                # Run a single step.
+                callbacks.on_step_begin(episode_step)    
+                # This is were all of the work happens. We first perceive and compute the action
+                # (forward step) and then use the reward to improve (backward step).
+                action_list = []
+                for o in observation:
+                    action = self.forward(o)
+                    action_list.append(action)
+                reward = np.zeros(len(env.agents))
+                done = False
+                for _ in range(action_repetition):
+                    for a in action_list:
+                        callbacks.on_action_begin(a)
+                    new_observation, r, done, _ = env.step(action_list)
+                    reward += r
+                    for i, a in enumerate(action_list):
+                        callbacks.on_action_begin(a)
+                        self.memory.append(observation[i], a, r[i], new_observation[i], done)
+                    if done:
+                        break
+                metrics = self.backward()
+                episode_reward += reward
+
+                for i, a in enumerate(action_list):
+                    step_logs = {
+                        'action': a,
+                        'observation': observation[i],
+                        'reward': r[i],
+                        'metrics': metrics,
+                        'episode': episode,
+                    }
+                    callbacks.on_step_end(episode_step, step_logs)
+                observation = new_observation
+                episode_step += 1
+                self.step += 1
+
+                if done or (nb_max_episode_steps and episode_step > nb_max_episode_steps):
+                    # This episode is finished, report and reset.
+                    for rew in episode_reward:
+                        episode_logs = {
+                            'episode_reward': rew,
+                            'nb_episode_steps': episode_step,
+                            'nb_steps': self.step,
+                        }
+                        callbacks.on_episode_end(episode, episode_logs)
+
+                    episode += 1
+                    observation = None
+                    episode_step = None
+                    episode_reward = None
+        except KeyboardInterrupt:
+            # We catch keyboard interrupts here so that training can be be safely aborted.
+            # This is so common that we've built this right into this function, which ensures that
+            # the `on_train_end` method is properly called.
+            did_abort = True
+        callbacks.on_train_end(logs={'did_abort': did_abort})
+
+        return history
+
 
     def test(self, env, nb_episodes=1, action_repetition=1, callbacks=None, visualize=True,
              nb_max_episode_steps=None, nb_max_start_steps=0, start_step_policy=None, verbose=1):
@@ -190,7 +324,7 @@ class Agent(object):
                     if d:
                         done = True
                         break
-                self.backward(reward, terminal=done)
+                self.backward()
                 episode_reward += reward
                 
                 callbacks.on_step_end(episode_step)
@@ -206,13 +340,103 @@ class Agent(object):
 
         return history
 
+
+    def ma_test(self, env, nb_episodes=1, action_repetition=1, callbacks=None, visualize=True,
+             nb_max_episode_steps=None, nb_max_start_steps=0, start_step_policy=None, verbose=1):
+        if not self.compiled:
+            raise RuntimeError('Your tried to test your agent but it hasn\'t been compiled yet. Please call `compile()` before `test()`.')
+        if action_repetition < 1:
+            raise ValueError('action_repetition must be >= 1, is {}'.format(action_repetition))
+
+        self.training = False
+        
+        callbacks = [] if not callbacks else callbacks[:]
+
+        if verbose >= 1:
+            callbacks += [TestLogger()]
+        if visualize:
+            callbacks += [Visualizer()]
+        history = History()
+        callbacks += [history]
+        callbacks = CallbackList(callbacks)
+        callbacks._set_model(self)
+        callbacks._set_env(env)
+        callbacks._set_params({
+            'nb_episodes': nb_episodes,
+        })
+
+        callbacks.on_train_begin()
+        for episode in range(nb_episodes):
+            callbacks.on_episode_begin(episode)
+            episode_reward = 0.
+            episode_step = 0
+
+            # Obtain the initial observation by resetting the environment.
+            self.reset_states()
+            observation = env.reset()
+            assert observation is not None
+
+            # Perform random starts at beginning of episode and do not record them into the experience.
+            # This slightly changes the start position between games.
+            nb_random_start_steps = 0 if nb_max_start_steps == 0 else np.random.randint(nb_max_start_steps)
+            for _ in range(nb_random_start_steps):
+                action_list = []
+                for o in observation:
+                    if start_step_policy is None:
+                        action = env.action_space.sample()
+                    else:
+                        action = start_step_policy(o)
+                    action_list.append(action)
+                callbacks.on_action_begin(action)
+                observation, _, done, _ = env.step(action_list)
+                callbacks.on_action_end(action)
+                if done:
+                    warnings.warn('Env ended before {} random steps could be performed at the start. You should probably lower the `nb_max_start_steps` parameter.'.format(nb_random_start_steps))
+                    observation = env.reset()
+                    break
+
+            # Run the episode until we're done.
+            done = False
+            while not done:
+                callbacks.on_step_begin(episode_step)
+
+                action_list = []
+                for o in observation:
+                    action = self.forward(o)
+                    action_list.append(action_list)
+                reward = np.zeros(len(env.agents))
+                for _ in range(action_repetition):
+                    callbacks.on_action_begin(action)
+                    observation, r, d, _ = env.step(action)
+                    callbacks.on_action_end(action)
+                    reward += r
+                    if d:
+                        done = True
+                        break
+                self.backward()
+                episode_reward += reward
+                
+                callbacks.on_step_end(episode_step)
+                episode_step += 1
+                if nb_max_episode_steps and episode_step > nb_max_episode_steps:
+                    done = True
+            episode_logs = {
+                'episode_reward': episode_reward,
+                'nb_steps': episode_step,
+            }
+            callbacks.on_episode_end(episode, episode_logs)
+        callbacks.on_train_end()
+
+        return history
+
+
     def reset_states(self):
         pass
 
     def forward(self, observation):
         raise NotImplementedError()
 
-    def backward(self, reward, terminal):
+    def backward(self):
         raise NotImplementedError()
 
     def compile(self, optimizer, metrics=[]):

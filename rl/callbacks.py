@@ -127,6 +127,8 @@ class TrainEpisodeLogger(Callback):
         self.metrics[episode] = []
 
     def on_episode_end(self, episode, logs):
+        import IPython
+        IPython.embed()
         duration = timeit.default_timer() - self.episode_start[episode]
         episode_steps = len(self.observations[episode])
 
